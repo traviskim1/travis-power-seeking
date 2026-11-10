@@ -1,0 +1,132 @@
+# aupower configuration. This is the single place for models, difficulty levels, the number of
+# trajectories and sampled states, rollouts per goal, step limits, random seeds, prices and the
+# spending budget. `python -m aupower run --profile smoke` merges [profiles.smoke] over these base
+# settings; `--set section.key=value` overrides single values from the command line.
+
+[run]
+mode = "dry"                       # "dry": mock model client + mock browser, no network at all.
+                                   # "live": OpenRouter models + Playwright browser (needs OPENROUTER_API_KEY in .env).
+name = "dev"                       # outputs go to runs/<name>/
+browser = "auto"                   # "auto" = mock in dry mode, playwright in live mode; or "mock" / "playwright"
+headless = true
+viewport = [1280, 800]
+max_concurrent_rollouts = 4
+max_concurrent_judge_calls = 8
+history_screenshots = 3            # screenshots kept in the agent's context; the text history is always kept in full
+page_text_chars = 4000             # visible page text given to the agent per observation
+max_elements = 150                 # interactive elements listed per observation
+tasks_path = "vendor/odysseys/data/odysseys.json"
+runs_dir = "runs"
+retry_failed_rollouts = true       # re-run rollouts whose previous attempt ended in an error
+action_timeout_s = 30
+screenshot_format = "jpeg"           # Playwright screenshots: "jpeg" keeps judge payloads small (every screenshot is sent); or "png"
+screenshot_quality = 85
+
+[models]
+# Agent policies (section 7). Every policy is run on the same trajectories, goals and step limits.
+# The policy is the model plus the prompts, scaffold and decoding settings below, all held fixed.
+# `endpoint` pins every call to one OpenRouter endpoint (SKILL.md; README "Provider pinning"): the slug is the dated
+# October 17, 2026 checkpoint and the endpoint is DeepInfra's declared-fp8 serving of it (tag "deepinfra/fp8": 1M
+# context, 393k max output, implicit caching; $0.098/$0.294 per M tokens on 2026-11-05). DeepSeek's own endpoint
+# (tag "deepseek", the lab's reference serving, $0.15/$0.60) was the first choice, but OpenRouter classes it as
+# "paid model training" and the account's privacy setting (openrouter.ai/settings/privacy) excludes such providers,
+# so its probe 404s; DeepInfra was chosen instead on 2026-11-05. `python -m aupower endpoints --all` lists all the
+# endpoints. The undated slug deepseek/deepseek-v4.1-flash is a floating name (on 2026-11-05 it served the
+# September 10 checkpoint), so it is not used.
+agents = [
+  { id = "deepseek/deepseek-v4.1-flash-1017", endpoint = "deepinfra/fp8", supports_images = true, temperature = 1.0, max_tokens = 4096 },
+]
+# The Odysseys judge (section 6): gemini-3.1-flash-lite-preview through OpenRouter, pinned to Google AI Studio's
+# standard tier (the only provider; "google-ai-studio/flex" and "google-ai-studio/priority" are its other service tiers).
+judge = { id = "google/gemini-3.1-flash-lite-preview", endpoint = "google-ai-studio", supports_images = true, max_tokens = 8192 }   # no temperature: provider default, as in the official judge script
+t_reference_model = ""             # model whose s0 rollouts define T for each goal; "" = the first agent model
+
+[experiment]
+levels = ["easy"]                  # difficulty levels, each with its own goal distribution D (section 3)
+n_trajectories = 5                 # trajectory tasks g per level
+state_fractions = [0.25, 0.5, 0.75]   # sampled states S: fractions of the way through the trajectory
+n_aux_goals = 30                   # auxiliary goals per state (equation 5)
+rollouts_per_goal = 3              # r (section 4, step 3)
+max_steps = 200                    # each rollout runs up to this many steps; the agent is never told this number
+step_limit_fractions = [0.05, 0.10, 0.20, 0.30, 0.50, 0.60, 0.80, 0.90, 0.95, 1.00]   # H = p x T
+fresh_context_forks = true         # the fresh-context control (section 1, step 8 of section 4)
+baseline_all_tasks = true          # s0 rollouts for every task at the level (section 8, step 1); false = sampled goals only
+trajectory_task_ids = []           # explicit trajectory tasks; [] = seeded sample from the level
+excluded_task_ids = []             # goals with irreversible external effects, excluded from sampling
+start_url = ""                     # "" = each task's own `website` field (always https://www.google.com)
+
+[seeds]
+base = 20261105                    # all other seeds (trajectory choice, goal draws, mock behaviour) derive from this
+
+[judge]
+h_scoring_mode = "rescore"         # "rescore": the official judge re-scores the rollout cut at each H (default).
+                                   # "first_step": one call per rubric item asking for the first step it was met (cheap; unvalidated).
+t_method = "first_step"            # how T is measured on the s0 rollouts: "first_step" (one call per item) or "bisect"
+                                   # (official judge prompt at bisected cut-offs; ~log2(steps) calls per item).
+max_images = 0                     # 0 = every screenshot is sent, as in the official script
+
+[cost]
+# Budget catcher. The run ends as soon as real spend would pass this amount: no further model call is
+# made, every rollout and judge result finished so far stays on disk, the analysis is run on what exists
+# (results/ is marked PARTIAL) and the reason goes to runs/<name>/budget_stop.json. The amount is the
+# real spend recorded across every run under runs_dir (each run's ledger.jsonl), so two runs cannot each
+# spend it in full. Dry runs cost nothing and are never stopped by it (unless mock.charge_estimated_cost
+# is on). Raise it and re-run the same command to continue: finished work is reused, not repeated.
+spending_cap_usd = 60.0
+
+[cost.prices."deepseek/deepseek-v4.1-flash-1017"]   # USD per million tokens: the pinned endpoint's (deepinfra/fp8) list price
+input_per_m = 0.098                                 # on 2026-11-05 (the pre-flight warns when the endpoint's current prices differ)
+output_per_m = 0.294
+cached_input_per_m = 0.0029
+
+[cost.prices."google/gemini-3.1-flash-lite-preview"]
+input_per_m = 0.25
+output_per_m = 1.50
+cached_input_per_m = 0.025
+
+[cost.planning]                    # planning assumptions from section 8 (replaced by measurements via `estimate --from-ledger`)
+steps_per_rollout = 50
+input_tokens_per_step = 25000
+output_tokens_per_step = 1500
+cache_fraction = 0.8
+judge_input_tokens_full_trajectory = 20000
+judge_output_tokens_per_call = 300
+image_tokens = 1000                # per screenshot, for pre-call cap checks
+
+[routing]
+# Provider pinning (SKILL.md "use-openrouter-safely"; README "Provider pinning"). Every request carries a `provider`
+# object made of the model's `endpoint` (only = [endpoint]) and the first three settings here. The pre-flight and the
+# probe check the pins before anything runs; who served every call is recorded in ledger.jsonl and results/routing.json.
+allow_fallbacks = false            # a pinned endpoint that is down is an error, never a silent switch of weights
+require_parameters = true          # route only to an endpoint that honours every parameter sent (nothing dropped silently)
+data_collection = "allow"          # "deny" = only providers that do not retain or train on prompts (OpenRouter's data-policy flag).
+                                   # Set to "allow" on 2026-11-05: OpenRouter classes DeepSeek's own endpoint as "paid model training"
+                                   # and the probe 404'd under "deny"; the prompts are the public Odysseys tasks and public web pages.
+preflight = true                   # before a run: fetch the endpoint lists, check the pins, save the snapshot, diff with earlier ones
+probe = true                       # live runs: one minimal paid call per model through its pin before any rollout (fractions of a cent)
+provenance_lookup = true           # when a response does not name its provider, ask GET /api/v1/generation (free) who served it
+
+[mock]                             # dry-run behaviour of the mock model client and mock browser
+steps_mean = 12                    # mean rollout length before the mock agent says it is done
+item_met_prob = 0.6                # probability that a rubric item is ever met in a mock rollout
+charge_estimated_cost = false      # true: mock calls charge their estimated price against the budget, to rehearse the budget stop
+
+[profiles.smoke]                   # section 8: one trajectory, two sampled states, one rollout per goal, no fresh-context forks
+run = { name = "smoke" }
+experiment = { n_trajectories = 1, state_fractions = [0.25, 0.75], rollouts_per_goal = 1, fresh_context_forks = false }
+
+[profiles.initial]                 # the first run: easy tasks only, 3 hand-picked trajectories x 1 state (halfway), 30 goals x 1 rollout, full context only
+run = { name = "initial" }
+
+[profiles.initial.experiment]
+n_trajectories = 3
+state_fractions = [0.5]
+rollouts_per_goal = 1
+fresh_context_forks = false
+# The three trajectory tasks, chosen 2026-11-05 for diversity of domain, site type and interaction (README, "The initial
+# run"); the 30 auxiliary goals of each are still drawn by seed from the other 44 easy tasks.
+trajectory_task_ids = [
+  "5632294e494e6e86eb94739235bfa2373b868868",   # vehicles / ecommerce: RockAuto brake kits for a 2020 Traverse, Haynes manual, Amazon tool (5 rubric items)
+  "71f8e3e9b5a24f37f492fbf97b7d31e08e9a8d61",   # UK finance / government: HMRC side-hustle guidance, Reed tax calculator, take-home pay calculator (4 items)
+  "890a6880049a42684ac91a2e1809442846f9394c",   # travel / transport: Chicago-Aurora transit directions, Metra BNSF line and fares, Aurora 3-day forecast (5 items)
+]
